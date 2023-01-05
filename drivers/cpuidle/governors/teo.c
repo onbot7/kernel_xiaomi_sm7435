@@ -2,8 +2,17 @@
 /*
  * Timer events oriented CPU idle governor
  *
- * Copyright (C) 2018 Intel Corporation
+ * TEO governor:
+ * Copyright (C) 2018 - 2021 Intel Corporation
  * Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+ *
+ * Util-awareness mechanism:
+ * Copyright (C) 2022 Arm Ltd.
+ * Author: Kajetan Puchalski <kajetan.puchalski@arm.com>
+ */
+
+/**
+ * DOC: teo-description
  *
  * The idea of this governor is based on the observation that on many systems
  * timer events are two or more orders of magnitude more frequent than any
@@ -43,13 +52,54 @@
  *   target residency of the idle state selected so far, use those values to
  *   compute the new expected idle duration and find an idle state matching it
  *   (which has to be shallower than the one selected so far).
+ *
+ * Util-awareness mechanism:
+ *
+ * The idea behind the util-awareness extension is that there are two distinct
+ * scenarios for the CPU which should result in two different approaches to idle
+ * state selection - utilized and not utilized.
+ *
+ * In this case, 'utilized' means that the average runqueue util of the CPU is
+ * above a certain threshold.
+ *
+ * When the CPU is utilized while going into idle, more likely than not it will
+ * be woken up to do more work soon and so a shallower idle state should be
+ * selected to minimise latency and maximise performance. When the CPU is not
+ * being utilized, the usual metrics-based approach to selecting the deepest
+ * available idle state should be preferred to take advantage of the power
+ * saving.
+ *
+ * In order to achieve this, the governor uses a utilization threshold.
+ * The threshold is computed per-cpu as a percentage of the CPU's capacity
+ * by bit shifting the capacity value. Based on testing, the shift of 6 (~1.56%)
+ * seems to be getting the best results.
+ *
+ * Before selecting the next idle state, the governor compares the current CPU
+ * util to the precomputed util threshold. If it's below, it defaults to the
+ * TEO metrics mechanism. If it's above, the idle state will be reduced to C0
+ * as long as C0 is not a polling state.
  */
 
 #include <linux/cpuidle.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/sched/clock.h>
+#include <linux/sched/topology.h>
 #include <linux/tick.h>
+
+/*
+ * The number of bits to shift the cpu's capacity by in order to determine
+ * the utilized threshold.
+ *
+ * 6 was chosen based on testing as the number that achieved the best balance
+ * of power and performance on average.
+ *
+ * The resulting threshold is high enough to not be triggered by background
+ * noise and low enough to react quickly when activity starts to ramp up.
+ */
+#define UTIL_THRESHOLD_SHIFT 6
+
 
 /*
  * The PULSE value is added to metrics when they grow and the DECAY_SHIFT value
@@ -98,6 +148,8 @@ struct teo_idle_state {
  * @states: Idle states data corresponding to this CPU.
  * @interval_idx: Index of the most recent saved idle interval.
  * @intervals: Saved idle duration values.
+ * @util_threshold: Threshold above which the CPU is considered utilized
+ * @utilized: Whether the last sleep on the CPU happened while utilized
  */
 struct teo_cpu {
 	u64 time_span_ns;
@@ -105,9 +157,30 @@ struct teo_cpu {
 	struct teo_idle_state states[CPUIDLE_STATE_MAX];
 	int interval_idx;
 	u64 intervals[INTERVALS];
+	unsigned long util_threshold;
+	bool utilized;
 };
 
 static DEFINE_PER_CPU(struct teo_cpu, teo_cpus);
+
+/**
+ * teo_cpu_is_utilized - Check if the CPU's util is above the threshold
+ * @cpu: Target CPU
+ * @cpu_data: Governor CPU data for the target CPU
+ */
+#ifdef CONFIG_SMP
+static bool teo_cpu_is_utilized(int cpu, struct teo_cpu *cpu_data)
+{
+	unsigned long max = arch_scale_cpu_capacity(cpu);
+
+	return sched_cpu_util(cpu, max) > cpu_data->util_threshold;
+}
+#else
+static bool teo_cpu_is_utilized(int cpu, struct teo_cpu *cpu_data)
+{
+	return false;
+}
+#endif
 
 /**
  * teo_update - Update CPU data after wakeup.
@@ -213,15 +286,17 @@ static bool teo_time_ok(u64 interval_ns)
  * @dev: Target CPU.
  * @state_idx: Index of the capping idle state.
  * @duration_ns: Idle duration value to match.
+ * @no_poll: Don't consider polling states.
  */
 static int teo_find_shallower_state(struct cpuidle_driver *drv,
 				    struct cpuidle_device *dev, int state_idx,
-				    u64 duration_ns)
+				    u64 duration_ns, bool no_poll)
 {
 	int i;
 
 	for (i = state_idx - 1; i >= 0; i--) {
-		if (dev->states_usage[i].disable)
+		if (dev->states_usage[i].disable ||
+		    (no_poll && (drv->states[i].flags & CPUIDLE_FLAG_POLLING)))
 			continue;
 
 		state_idx = i;
@@ -264,6 +339,20 @@ static int teo_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	prev_max_early_idx = -1;
 	constraint_idx = drv->state_count;
 	idx = -1;
+
+	cpu_data->utilized = teo_cpu_is_utilized(dev->cpu, cpu_data);
+	/*
+	 * The cpu is being utilized over the threshold there are only 2 states to choose from.
+	 * No need to consider metrics, choose the shallowest non-polling state and exit.
+	 */
+	if (drv->state_count < 3 && cpu_data->utilized) {
+		for (i = 0; i < drv->state_count; ++i) {
+			if (!dev->states_usage[i].disable && !(drv->states[i].flags & CPUIDLE_FLAG_POLLING)) {
+				idx = i;
+				goto end;
+			}
+		}
+	}
 
 	for (i = 0; i < drv->state_count; i++) {
 		struct cpuidle_state *s = &drv->states[i];
@@ -409,11 +498,19 @@ static int teo_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 				duration_ns = avg_ns;
 				if (drv->states[idx].target_residency_ns > avg_ns)
 					idx = teo_find_shallower_state(drv, dev,
-								       idx, avg_ns);
+								       idx, avg_ns, false);
 			}
 		}
 	}
 
+	/*
+	 * If the CPU is being utilized over the threshold,
+	 * choose a shallower non-polling state to improve latency
+	 */
+	if (cpu_data->utilized)
+		idx = teo_find_shallower_state(drv, dev, idx, duration_ns, true);
+
+end:
 	/*
 	 * Don't stop the tick if the selected state is a polling one or if the
 	 * expected idle duration is shorter than the tick period length.
@@ -429,7 +526,7 @@ static int teo_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		 * that.
 		 */
 		if (idx > 0 && drv->states[idx].target_residency_ns > delta_tick)
-			idx = teo_find_shallower_state(drv, dev, idx, delta_tick);
+			idx = teo_find_shallower_state(drv, dev, idx, delta_tick, false);
 	}
 
 	return idx;
@@ -468,9 +565,11 @@ static int teo_enable_device(struct cpuidle_driver *drv,
 			     struct cpuidle_device *dev)
 {
 	struct teo_cpu *cpu_data = per_cpu_ptr(&teo_cpus, dev->cpu);
+	unsigned long max_capacity = arch_scale_cpu_capacity(dev->cpu);
 	int i;
 
 	memset(cpu_data, 0, sizeof(*cpu_data));
+	cpu_data->util_threshold = max_capacity >> UTIL_THRESHOLD_SHIFT;
 
 	for (i = 0; i < INTERVALS; i++)
 		cpu_data->intervals[i] = U64_MAX;
